@@ -2,18 +2,49 @@ import { createServerClient } from '@supabase/ssr'
 import { cookies } from 'next/headers'
 import { NextResponse } from 'next/server'
 import ExcelJS from 'exceljs'
-// import PDFDocument from 'pdfkit' // We'll handle this dynamically or use a different approach if needed, but pdfkit is standard for node.
+
+// Define types for strict TypeScript
+interface LeadData {
+    id: string
+    client_name: string
+    policy_type: string
+    renewal_date: string | null
+    created_at: string
+    carrier: string | null
+    total_premium: number | null
+    policy_number: string | null
+    policy_flow: string | null
+    insurence_category: string | null
+    assigned_csr: string | null
+    assigned_csr_profile?: {
+        full_name: string | null
+    } | {
+        full_name: string | null
+    }[] | null
+}
 
 export async function POST(request: Request) {
-    const cookieStore = cookies()
+    // In Next.js 15/16 (detected in package.json), cookies() is asynchronous.
+    // The error "Property 'get' does not exist on type 'Promise<ReadonlyRequestCookies>'"
+    // confirms that cookies() returns a Promise and must be awaited.
+    const cookieStore = await cookies()
 
     const supabase = createServerClient(
         process.env.NEXT_PUBLIC_SUPABASE_URL!,
         process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
         {
             cookies: {
-                get(name: string) {
-                    return cookieStore.get(name)?.value
+                getAll() {
+                    return cookieStore.getAll()
+                },
+                setAll(cookiesToSet) {
+                    try {
+                        cookiesToSet.forEach(({ name, value, options }) =>
+                            cookieStore.set(name, value, options)
+                        )
+                    } catch {
+                        // The `setAll` method was called from a Server Component.
+                    }
                 },
             },
         }
@@ -21,14 +52,14 @@ export async function POST(request: Request) {
 
     // 1. Auth Check
     const {
-        data: { session },
-    } = await supabase.auth.getSession()
+        data: { user },
+        error: authError
+    } = await supabase.auth.getUser()
 
-    if (!session) {
+    if (authError || !user) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const user = session.user
     const body = await request.json()
     const {
         month,
@@ -48,7 +79,6 @@ export async function POST(request: Request) {
         .single()
 
     if (profileError || !profile) {
-        // Fallback if no profile: treat as agent (strict)
         console.error('Profile not found', profileError)
         return NextResponse.json({ error: 'Profile not found. Contact admin.' }, { status: 403 })
     }
@@ -75,28 +105,10 @@ export async function POST(request: Request) {
 
     // 4. Apply Filters
     if (month) {
-        // month is YYYY-MM
         const startDate = `${month}-01`
         const [y, m] = month.split('-')
-        // Calculate end date
-        const date = new Date(parseInt(y), parseInt(m), 0) // last day of month
+        const date = new Date(parseInt(y), parseInt(m), 0)
         const endDate = date.toISOString().split('T')[0]
-
-        // Filter by created_at for new business, renewal_date for renewals?
-        // Requirement says: "policy_buying_date (month range)"
-        // We'll use created_at for 'new' and renewal_date for 'renewal' OR just use a generic date field if we had one.
-        // For now, let's assume we filter on created_at for ALL, or split logic.
-        // Actually, usually reports are based on "Effective Date". We don't have effective date explicitly, maybe renewal_date?
-        // Let's use logic: if policy_flow = renewal -> use renewal_date. If new -> use created_at (or we should add effective_date).
-        // Given the constraints, let's filter based on policy_flow if specific, or general.
-        // Simplified: "policy_buying_date" requested. Let's assume we use `renewal_date` for everything for now as primary date, 
-        // or `created_at` if renewal_date is null.
-        // A better approach for a report:
-        // .or(`renewal_date.gte.${startDate},created_at.gte.${startDate}`) -- too complex.
-        // Let's stick to: if renewal_date exists, use it.
-
-        // User requirement: "policy_buying_date (month range)"
-        // We don't have this column. We'll use `renewal_date` for now as primary metric for "when business happens".
         query = query.gte('renewal_date', startDate).lte('renewal_date', endDate)
     }
 
@@ -105,13 +117,10 @@ export async function POST(request: Request) {
     if (policy_flow) query = query.eq('policy_flow', policy_flow)
     if (customer_name) query = query.ilike('client_name', `%${customer_name}%`)
 
-    // 5. Apply RBAC Filters (Server-side Enforcement)
+    // 5. Apply RBAC Filters
     if (role === 'admin') {
-        // No extra filter. Can filter by specific CSR if requested.
         if (assigned_csr) query = query.eq('assigned_csr', assigned_csr)
     } else if (role === 'manager') {
-        // Show self + team
-        // Get team members
         const { data: team } = await supabase
             .from('profiles')
             .select('id')
@@ -120,7 +129,6 @@ export async function POST(request: Request) {
         const teamIds = team?.map(t => t.id) || [user.id]
 
         if (assigned_csr) {
-            // If filtering by specific CSR, ensure they are in team
             if (!teamIds.includes(assigned_csr)) {
                 return NextResponse.json({ error: 'Access denied to this CSR data' }, { status: 403 })
             }
@@ -129,7 +137,6 @@ export async function POST(request: Request) {
             query = query.in('assigned_csr', teamIds)
         }
     } else {
-        // Agent: Only see own
         if (assigned_csr && assigned_csr !== user.id) {
             return NextResponse.json({ error: 'Access denied' }, { status: 403 })
         }
@@ -141,6 +148,8 @@ export async function POST(request: Request) {
     if (error) {
         return NextResponse.json({ error: error.message }, { status: 500 })
     }
+
+    const typedData = data as unknown as LeadData[] | null
 
     // 6. Handle Export
     if (exportType === 'excel') {
@@ -157,27 +166,33 @@ export async function POST(request: Request) {
             { header: 'Date', key: 'date', width: 15 },
         ]
 
-        data?.forEach((row: any) => {
+        typedData?.forEach((row) => {
+            const csrInfo = row.assigned_csr_profile
+            const csrFullName = Array.isArray(csrInfo) 
+                ? csrInfo[0]?.full_name 
+                : csrInfo?.full_name
+
             worksheet.addRow({
                 client_name: row.client_name,
                 policy_type: row.policy_type,
                 insurence_category: row.insurence_category,
                 policy_flow: row.policy_flow,
                 total_premium: row.total_premium,
-                csr: row.assigned_csr_profile?.full_name || row.assigned_csr,
-                date: row.renewal_date || row.created_at
+                csr: csrFullName || row.assigned_csr,
+                date: row.renewal_date || (row.created_at ? row.created_at.split('T')[0] : '-')
             })
         })
 
         const buffer = await workbook.xlsx.writeBuffer()
 
-        return new Response(buffer, {
+        return new Response(buffer as any, {
             headers: {
                 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                 'Content-Disposition': `attachment; filename="Monthly_Report_${month || 'All'}.xlsx"`
             }
         })
     }
+
 
     if (exportType === 'pdf') {
         const { default: PDFDocument } = await import('pdfkit')
@@ -197,9 +212,9 @@ export async function POST(request: Request) {
         doc.pipe({
             write: (chunk: any) => writer.write(chunk),
             end: () => writer.close(),
-            on: (event: string, listener: any) => { },
-            once: (event: string, listener: any) => { },
-            emit: (event: string, ...args: any[]) => true,
+            on: () => { },
+            once: () => { },
+            emit: () => true,
         } as any)
 
         // --- PDF CONTENT ---
@@ -238,22 +253,26 @@ export async function POST(request: Request) {
 
         let totalPremium = 0
 
-        data?.forEach((row: any) => {
+        typedData?.forEach((row) => {
             // Page Break if needed
             if (y > 750) {
                 doc.addPage()
                 y = 50
-                // Re-draw header? simplified for now
             }
 
             const premium = row.total_premium || 0
             totalPremium += premium
 
+            const csrInfo = row.assigned_csr_profile
+            const csrFullName = Array.isArray(csrInfo) 
+                ? csrInfo[0]?.full_name 
+                : csrInfo?.full_name
+
             doc.text(row.client_name?.substring(0, 20) || '-', colX.client, y)
             doc.text(row.policy_type?.substring(0, 20) || '-', colX.type, y)
             doc.text(`$${premium.toLocaleString()}`, colX.premium, y)
-            doc.text(row.assigned_csr_profile?.full_name?.substring(0, 15) || row.assigned_csr?.substring(0, 8) || '-', colX.csr, y)
-            doc.text(row.renewal_date || row.created_at?.split('T')[0] || '-', colX.date, y)
+            doc.text(csrFullName?.substring(0, 15) || row.assigned_csr?.substring(0, 8) || '-', colX.csr, y)
+            doc.text(row.renewal_date || (row.created_at ? row.created_at.split('T')[0] : '-'), colX.date, y)
 
             y += 20
         })
@@ -272,5 +291,6 @@ export async function POST(request: Request) {
         return new Response(readable, { headers })
     }
 
-    return NextResponse.json(data)
+    return NextResponse.json(typedData)
 }
+
