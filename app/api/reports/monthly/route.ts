@@ -27,7 +27,7 @@ export async function POST(request: Request) {
     // In Next.js 15/16 (detected in package.json), cookies() is asynchronous.
     // The error "Property 'get' does not exist on type 'Promise<ReadonlyRequestCookies>'"
     // confirms that cookies() returns a Promise and must be awaited.
-    const cookieStore = await cookies()
+    const cookieStore = await cookies() as Awaited<ReturnType<typeof cookies>>
 
     const supabase = createServerClient(
         process.env.NEXT_PUBLIC_SUPABASE_URL!,
